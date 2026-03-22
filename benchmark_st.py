@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Benchmark script for YARlabs/v5_Embedding_0.5B model on LegalQAEval dataset.
-Uses Lorentz distance for similarity computation in hyperbolic space.
+Benchmark script for sentence-transformers/all-MiniLM-L6-v2 model on MS MARCO dataset.
+Uses cosine similarity for retrieval.
 """
 
 import random
@@ -11,23 +11,11 @@ from typing import List, Tuple, Any
 
 import numpy as np
 import torch
-from datasets import load_dataset, concatenate_datasets
-from transformers import AutoTokenizer, AutoModel
+from sentence_transformers import SentenceTransformer
+from datasets import load_dataset
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def lorentz_dist(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """
-    Computes the exact Hyperbolic distance between two batches of Lorentz vectors.
-    """
-    u_0, u_x = u[..., 0:1], u[..., 1:]
-    v_0, v_x = v[..., 0:1], v[..., 1:]
-
-    inner_product = -u_0 * v_0 + (u_x * v_x).sum(dim=-1, keepdim=True)
-    inner_product = torch.min(inner_product, torch.tensor(-1.0, device=u.device))
-    return torch.acosh(-inner_product).squeeze(-1)
 
 
 def prepare_data_ms_marco(
@@ -85,61 +73,29 @@ def prepare_data_ms_marco(
 
 def batch_encode(
     texts: List[str],
-    model: AutoModel,
-    tokenizer: AutoTokenizer,
-    target_dim: int = 64,
-    batch_size: int = 32,
-    device: str = "cuda",
-) -> torch.Tensor:
-    """Encode texts in batches using the YarEmbedding model."""
-    all_embeddings = []
-
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i : i + batch_size]
-        inputs = tokenizer(
-            batch_texts,
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt",
-        ).to(device)
-
-        with torch.no_grad():
-            embeddings = model(**inputs, target_dim=target_dim)
-
-        all_embeddings.append(embeddings.cpu())
-
-    return torch.cat(all_embeddings, dim=0)
-
-
-def compute_similarity_lorentz(
-    queries: torch.Tensor, corpus: torch.Tensor
+    model: SentenceTransformer,
+    batch_size: int = 128,
+    show_progress: bool = True,
 ) -> np.ndarray:
+    """Encode texts in batches using the sentence-transformer model."""
+    embeddings = model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=show_progress,
+        convert_to_numpy=True,
+        normalize_embeddings=True,  # For cosine similarity
+    )
+    return embeddings
+
+
+def compute_similarity_cosine(queries: np.ndarray, corpus: np.ndarray) -> np.ndarray:
     """
-    Compute similarity scores using Lorentz distance.
-    For retrieval, we use negative distance (closer = higher similarity).
+    Compute cosine similarity scores.
+    With normalized embeddings, this is just dot product.
     """
-    device = queries.device
-
-    # Process in batches to avoid OOM
-    batch_size = 32
-    scores = []
-
-    for i in range(0, queries.shape[0], batch_size):
-        batch_queries = queries[i : i + batch_size].to(device)
-        batch_scores = []
-
-        for j in range(0, corpus.shape[0], batch_size):
-            batch_corpus = corpus[j : j + batch_size].to(device)
-            distances = lorentz_dist(
-                batch_queries[:, None, :], batch_corpus[None, :, :]
-            )
-            # Convert distance to similarity (negative distance)
-            batch_scores.append(-distances.float().cpu().numpy())
-
-        scores.append(np.concatenate(batch_scores, axis=1))
-
-    return np.concatenate(scores, axis=0)
+    # Efficient computation using matrix multiplication
+    scores = np.matmul(queries, corpus.T)
+    return scores
 
 
 def compute_metrics(
@@ -182,35 +138,26 @@ def compute_metrics(
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Benchmark YarEmbedding model")
-    parser.add_argument(
-        "--target_dim", type=int, default=64, help="Lorentz embedding dimension"
-    )
+    parser = argparse.ArgumentParser(description="Benchmark SentenceTransformer model")
     parser.add_argument(
         "--corpus_size", type=int, default=0, help="Corpus size (0 = full dataset)"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=32, help="Batch size for encoding"
-    )
-    parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+        "--batch_size", type=int, default=128, help="Batch size for encoding"
     )
     args = parser.parse_args()
 
-    logger.info(f"Target dimension: {args.target_dim}")
     logger.info(f"Corpus size: {args.corpus_size if args.corpus_size else 'full'}")
-    logger.info(f"Device: {args.device}")
+    logger.info(f"Batch size: {args.batch_size}")
 
     # Load model
-    model_id = "YARlabs/v5_Embedding_0.5B"
+    model_id = "sentence-transformers/all-MiniLM-L6-v2"
     logger.info(f"Loading model: {model_id}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModel.from_pretrained(
-        model_id, trust_remote_code=True, torch_dtype=torch.float32
-    )
-    model.eval()
-    model = model.to(args.device)
+    model = SentenceTransformer(model_id)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {device}")
+    model.to(device)
 
     logger.info("Model loaded successfully!")
 
@@ -239,10 +186,8 @@ def main():
     corpus_embeddings = batch_encode(
         unique_texts,
         model,
-        tokenizer,
-        target_dim=args.target_dim,
         batch_size=args.batch_size,
-        device=args.device,
+        show_progress=True,
     )
     corpus_encode_time = time.time() - t0
     logger.info(
@@ -255,20 +200,18 @@ def main():
     query_embeddings = batch_encode(
         query_list,
         model,
-        tokenizer,
-        target_dim=args.target_dim,
         batch_size=args.batch_size,
-        device=args.device,
+        show_progress=True,
     )
     query_encode_time = time.time() - t1
     logger.info(
         f"Queries encoded in {query_encode_time:.2f}s, shape: {query_embeddings.shape}"
     )
 
-    # Compute similarity using Lorentz distance
-    logger.info("Computing similarities using Lorentz distance...")
+    # Compute similarity using cosine similarity
+    logger.info("Computing similarities using cosine similarity...")
     t2 = time.time()
-    scores = compute_similarity_lorentz(query_embeddings, corpus_embeddings)
+    scores = compute_similarity_cosine(query_embeddings, corpus_embeddings)
     similarity_time = time.time() - t2
     logger.info(f"Similarity computation took {similarity_time:.2f}s")
 
@@ -280,7 +223,7 @@ def main():
     print("BENCHMARK RESULTS")
     print("=" * 60)
     print(f"Model: {model_id}")
-    print(f"Target dimension: {args.target_dim}")
+    print(f"Embedding dimension: 384")
     print(f"Corpus size: {len(unique_texts)}")
     print(f"Number of queries: {len(query_list)}")
     print("-" * 60)
